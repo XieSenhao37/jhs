@@ -40,7 +40,7 @@ jobs:
       run: |
         sudo apt-get update && DEBIAN_FRONTEND=noninteractive sudo apt-get install build-essential tree ninja-build gcc-multilib g++-multilib lib32stdc++-9-dev flex bison ruby ruby-dev python3-requests python3-setuptools python3-dev python3-pip libc6-dev libc6-dev-i386 -y
         sudo gem install fpm -v 1.11.0 --no-document
-        python3 -m pip install lief graphlib
+        python3 -m pip install "lief>=0.13,<1.0" graphlib_backport
 
     - name: Clone frida source
       run: |
@@ -61,6 +61,18 @@ jobs:
         cd build-android-arm64
         ../frida/configure --host=android-arm64
         make
+
+    - name: Post-build anti-detection patching
+      run: |
+        echo "=== Running post-build anti-detection patching ==="
+        python3 post_build_patch.py build-android-arm64
+        echo "=== Verifying patch results ==="
+        echo "frida string count in frida-server:"
+        strings build-android-arm64/subprojects/frida-core/server/frida-server | grep -c "frida" || echo "0"
+        echo "frida-agent string check:"
+        strings build-android-arm64/subprojects/frida-core/server/frida-server | grep "frida-agent" | head -5 || echo "none found"
+        echo "re.frida.server check:"
+        strings build-android-arm64/subprojects/frida-core/server/frida-server | grep "re.frida.server" | head -5 || echo "none found"
 
     - name: Package build results
       run: |
