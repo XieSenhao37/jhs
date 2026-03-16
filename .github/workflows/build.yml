@@ -55,18 +55,139 @@ jobs:
         echo "ANDROID_NDK_ROOT=$ANDROID_NDK_ROOT"
         
         git clone --recurse-submodules https://github.com/frida/frida
-        cd frida
-        for path in ../patches/*
-        do
-          name=$(basename $path)
-          real=$(realpath $path)
-          echo "Apply patches in $real to frida/subprojects/$name"
-          cd subprojects/$name
-          git am ../../../patches/$name/*.patch
-          cd ../..
-          echo $i
+        
+        # Apply patches to frida-core
+        cd frida/subprojects/frida-core
+        echo "=== Applying frida-core patches ==="
+        for patch in ../../../patches/frida-core/*.patch; do
+          echo "--- Trying patch: $(basename $patch) ---"
+          if git am --3way "$patch"; then
+            echo "    [OK] Applied successfully"
+          else
+            echo "    [WARN] git am failed, trying manual apply..."
+            git am --abort 2>/dev/null || true
+            
+            patch_name=$(basename "$patch")
+            
+            # Patch 0009: memfd-name-jit-cache
+            # Changes memfd_create to use hardcoded "jit-cache" name instead of the passed name
+            if [[ "$patch_name" == *"memfd"* ]] || [[ "$patch_name" == *"0009"* ]]; then
+              echo "    [MANUAL] Applying memfd-name-jit-cache fix..."
+              # Find the file containing memfd_create with the name parameter and replace
+              find . -name "*.vala" -exec grep -l "MEMFD_CREATE" {} \; | while read f; do
+                echo "    Patching $f"
+                sed -i 's/Linux\.syscall (LinuxSyscall\.MEMFD_CREATE, name, flags)/Linux.syscall (LinuxSyscall.MEMFD_CREATE, "jit-cache", flags)/g' "$f"
+              done
+              git add -A && git commit -m "Florida: memfd-name-jit-cache (manual)" --allow-empty
+              echo "    [OK] Manual patch applied"
+            
+            # Patch 0010: exec-anti-anti-frida.py
+            # Adds call to anti-anti-frida.py in embed-agent.py
+            elif [[ "$patch_name" == *"anti-anti"* ]] || [[ "$patch_name" == *"0010"* ]]; then
+              echo "    [MANUAL] Applying exec-anti-anti-frida.py fix..."
+              # Find embed-agent.py and add the anti-anti-frida call after embedded_agent write_bytes
+              EMBED_AGENT=$(find . -name "embed-agent.py" | head -1)
+              if [ -n "$EMBED_AGENT" ]; then
+                echo "    Found: $EMBED_AGENT"
+                # Use python to do the insertion safely
+                python3 - "$EMBED_AGENT" <<'PYEOF'
+import sys
+filepath = sys.argv[1]
+with open(filepath, 'r') as f:
+    content = f.read()
+
+# Check if already patched
+if 'anti-anti-frida' in content:
+    print("    Already patched, skipping")
+    sys.exit(0)
+
+# Find the insertion point: after embedded_agent.write_bytes(b"")
+insert_after = 'embedded_agent.write_bytes(b"")'
+if insert_after not in content:
+    # Try alternate patterns
+    for alt in ['embedded_agent.write_bytes(b"")', 'write_bytes(b"")']:
+        if alt in content:
+            insert_after = alt
+            break
+
+if insert_after in content:
+    injection = '''
+            import os
+            custom_script=str(output_dir)+"/../../../../frida/subprojects/frida-core/src/anti-anti-frida.py"
+            return_code = os.system("python3 "+custom_script+" "+str(priv_dir / f"frida-agent-{flavor}.so"))
+            if return_code == 0:
+                print("anti-anti-frida finished")
+            else:
+                print("anti-anti-frida error. Code:", return_code)
+'''
+    content = content.replace(insert_after, insert_after + '\n' + injection, 1)
+    with open(filepath, 'w') as f:
+        f.write(content)
+    print("    Injection point found and patched")
+else:
+    print("    WARNING: Could not find insertion point in embed-agent.py")
+    print("    Trying generic approach...")
+    # Try to find any write_bytes and insert after it
+    lines = content.split('\n')
+    new_lines = []
+    inserted = False
+    for line in lines:
+        new_lines.append(line)
+        if not inserted and 'write_bytes' in line and 'embedded_agent' in line:
+            indent = len(line) - len(line.lstrip())
+            spaces = ' ' * indent
+            new_lines.append(f'{spaces}import os')
+            new_lines.append(f'{spaces}custom_script=str(output_dir)+"/../../../../frida/subprojects/frida-core/src/anti-anti-frida.py"')
+            new_lines.append(f'{spaces}return_code = os.system("python3 "+custom_script+" "+str(priv_dir / f"frida-agent-{{flavor}}.so"))')
+            new_lines.append(f'{spaces}if return_code == 0:')
+            new_lines.append(f'{spaces}    print("anti-anti-frida finished")')
+            new_lines.append(f'{spaces}else:')
+            new_lines.append(f'{spaces}    print("anti-anti-frida error. Code:", return_code)')
+            inserted = True
+    if inserted:
+        with open(filepath, 'w') as f:
+            f.write('\n'.join(new_lines))
+        print("    Generic approach succeeded")
+    else:
+        print("    ERROR: Could not patch embed-agent.py")
+PYEOF
+                git add -A && git commit -m "Florida: exec-anti-anti-frida.py (manual)" --allow-empty
+                echo "    [OK] Manual patch applied"
+              else
+                echo "    [ERROR] embed-agent.py not found!"
+              fi
+            
+            else
+              echo "    [ERROR] Unknown failed patch: $patch_name - skipping"
+            fi
+          fi
         done
-        cd ..
+        cd ../../..
+        
+        # Apply patches to frida-gum
+        cd frida/subprojects/frida-gum
+        echo "=== Applying frida-gum patches ==="
+        for patch in ../../../patches/frida-gum/*.patch; do
+          echo "--- Trying patch: $(basename $patch) ---"
+          if git am --3way "$patch"; then
+            echo "    [OK] Applied successfully"
+          else
+            echo "    [WARN] git am failed for $(basename $patch), trying manual apply..."
+            git am --abort 2>/dev/null || true
+            
+            # frida-gum pool-frida patch: change g_set_prgname("frida") to g_set_prgname("ggbond")
+            echo "    [MANUAL] Applying pool-frida fix..."
+            find . -name "*.c" -exec grep -l 'g_set_prgname.*"frida"' {} \; | while read f; do
+              echo "    Patching $f"
+              sed -i 's/g_set_prgname ("frida")/g_set_prgname ("ggbond")/g' "$f"
+            done
+            git add -A && git commit -m "Florida: pool-frida for gum (manual)" --allow-empty
+            echo "    [OK] Manual patch applied"
+          fi
+        done
+        cd ../../..
+        
+        echo "=== All patches applied, starting build ==="
         
         # Build for arm64 only (faster, most common arch)
         mkdir build-android-arm64
